@@ -1,98 +1,102 @@
 use anyhow::Result;
-use core::str;
-use clap::Parser;
-use hyper::{
-    body::Incoming,
-    Request,
-    Response,
-    server::conn::http1,
-    service::service_fn,
+use axum::{
+    body::Bytes,
+    http::{HeaderMap, HeaderName, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Router,
 };
-use hyper_util::rt::TokioIo;
-use log::{debug, info, error};
-use std::{os::fd::AsFd, time::Duration};
-use socket2::{SockRef, TcpKeepalive};
-use tokio::net::TcpSocket;
+use clap::Parser;
+use std::{collections::HashMap, str::FromStr, time::Duration};
+use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Parser)]
 struct Args {
-    #[arg(short, long, default_value="127.0.0.1:8000")]
+    #[arg(short, long, default_value = "0.0.0.0:8000")]
     address: String,
 
-    #[arg(short='H', long="header")]
+    #[arg(short = 'H', long = "header")]
     headers: Option<Vec<String>>,
-}
 
-fn prepare_socket<S: AsFd>(socket: &S) -> Result<()> {
-    let socket = SockRef::from(&socket);
-    let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(10));
+    #[arg(short = 'e', long = "echo-header")]
+    header_echos: Option<Vec<String>>,
 
-    socket.set_nodelay(true)?;
-    socket.set_tcp_keepalive(&ka)?;
-
-    Ok(())
+    #[arg(short = 'd', long = "us-delay", default_value = "0")]
+    delay_us: u64,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::init();
+async fn main() {
+    // initialize tracing
+    tracing_subscriber::fmt::init();
 
     let Args {
         address,
-        headers
+        headers,
+        header_echos,
+        delay_us,
     } = Args::parse();
 
-    let addr = address.parse()?;
+    let headers = headers
+        .unwrap_or(vec![])
+        .iter()
+        .map(|h| {
+            let hs: Vec<&str> = h.split_terminator(":").map(|s| s.trim()).collect();
+            (hs[0].to_string(), hs[1].to_string())
+        })
+        .collect::<HashMap<String, String>>();
+    let header_echos = header_echos.unwrap_or_default();
 
-    info!("Listening on {addr}");
+    let echo = post(move |req_hdrs: HeaderMap, body: Bytes| {
+        log::trace!("Received request: {:?}", req_hdrs);
+        // this helps simulating slower backends
+        if delay_us > 0 {
+            std::thread::sleep(Duration::from_micros(delay_us));
+        }
 
-    let socket = TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
-    prepare_socket(&socket)?;
-    socket.bind(addr)?;
+        let mut res_hdrs = HeaderMap::new();
+        for (key, val) in headers.into_iter() {
+            let key = HeaderName::from_str(key.as_str()).unwrap();
+            res_hdrs.insert(key, val.parse().unwrap());
+        }
 
-    let listener = socket.listen(4096)?;
+        req_hdrs
+            .iter()
+            .filter(|(k, _)| header_echos.contains(&k.to_string()))
+            .for_each(|(k, v)| {
+                res_hdrs.insert(k, v.clone());
+            });
 
-    // We start a loop to continuously accept incoming connections
-    loop {
-        let (stream, _) = listener.accept().await?;
-        prepare_socket(&stream)?;
-        
-        debug!("Accepted connection {:?}", stream.peer_addr().unwrap());
+        echo(res_hdrs, body)
+    });
 
-        // Use an adapter to access something implementing `tokio::io` traits as if they implement
-        // `hyper::rt` IO traits.
-        let io = TokioIo::new(stream);
-        let headers = headers.clone();
+    // build our application with a route
+    let app = Router::new()
+        .route("/", echo.clone())
+        .route("/{path}", echo);
 
-        // Spawn a tokio task to serve multiple connections concurrently
-        tokio::task::spawn(async move {
-            // Finally, we bind the incoming connection to our `hello` service
-            if let Err(err) = http1::Builder::new()
-                // `service_fn` converts our function in a `Service`
-                .serve_connection(io, service_fn(|req: Request<Incoming>| async {
-                    debug!("Received request: {:?}", req);
+    let listener = tokio::net::TcpListener::bind(address.clone())
+        .await
+        .unwrap();
+    log::info!("Listening on {}", address);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
 
-                    let mut res = Response::builder();
+async fn echo(headers: HeaderMap, body: Bytes) -> Result<impl IntoResponse, StatusCode> {
+    if let Ok(body) = String::from_utf8(body.to_vec()) {
+        Ok((headers, body))
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
 
-                    if let Some(headers) = &headers {
-                        for header in headers {
-                            let hs: Vec<&str> = header
-                                .split_terminator(":")
-                                .map(|s| s.trim())
-                                .collect();
-                            res = res.header(hs[0], hs[1]);
-                        }   
-                    }
-
-                    let body: Incoming = req.into_body();
-                    res.body(body)
-                }))
-                .await
-            {
-                error!("Error serving connection: {:?}", err);
-            }
-        });
+async fn shutdown_signal() {
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
     }
 }
